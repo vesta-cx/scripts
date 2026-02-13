@@ -13,15 +13,21 @@
 #   -b, --bitrates  Comma-separated bitrates in kbps (default: 320,256,192,160,128,96,64,48,32)
 #   -h, --help      Show this help
 #
-# When input is a directory, all audio files in it (non-recursive) are processed.
-# Non-lossless files in the directory are skipped with a warning.
+# When input is a directory, all audio files in it are processed recursively.
+# Non-lossless files are skipped with a warning.
 #
-# Output structure:
-#   <output-dir>/
-#     flac/{basename}_0.flac
-#     opus/{basename}_{bitrate}.ogg
-#     mp3/{basename}_{bitrate}.mp3
-#     aac/{basename}_{bitrate}.m4a
+# Output structure (source-first, mirrors input directory structure):
+#   Single file input:
+#     <output>/{basename}/{codec}_{bitrate}.{ext}
+#
+#   Directory input:
+#     <output>/{relative-path}/{basename}/{codec}_{bitrate}.{ext}
+#
+#   Example:
+#     input: music/jazz/take-five.flac
+#     output: out/jazz/take-five/opus_128.ogg
+#                                mp3_128.mp3
+#                                flac_0.flac
 #
 # Notes:
 #   - FLAC ignores the bitrate list (always outputs as lossless / bitrate=0)
@@ -51,7 +57,7 @@ usage() {
 
 		Options:
 		  -i, --input     Input file or directory (must be lossless: FLAC, WAV, AIFF, ALAC, etc.)
-		                  When a directory, all audio files in it are processed (non-recursive).
+		                  When a directory, all audio files are processed recursively.
 		  -o, --output    Output directory (default: current directory)
 		  -c, --codecs    Comma-separated codecs (default: flac,opus,mp3,aac)
 		  -b, --bitrates  Comma-separated bitrates in kbps (default: 320,256,192,160,128,96,64,48,32)
@@ -140,25 +146,33 @@ command -v ffprobe >/dev/null 2>&1 || die "ffprobe is required but not found in 
 # -- Resolve input files -------------------------------------------------------
 
 INPUT_FILES=()
+INPUT_BASE=""
 
 if [[ -d "$INPUT" ]]; then
+	INPUT_BASE="$(cd "$INPUT" && pwd)"
+	# Build glob pattern for find
+	FIND_NAMES=()
 	for ext in $AUDIO_EXTENSIONS; do
-		for f in "$INPUT"/*."$ext"; do
-			[[ -f "$f" ]] || continue
-			if is_lossless "$f"; then
-				INPUT_FILES+=("$f")
-			else
-				warn "Skipping '$(basename "$f")' -- not a lossless codec"
-			fi
-		done
+		FIND_NAMES+=(-o -iname "*.$ext")
 	done
+	# Remove leading -o
+	unset 'FIND_NAMES[0]'
+
+	while IFS= read -r -d '' f; do
+		if is_lossless "$f"; then
+			INPUT_FILES+=("$f")
+		else
+			warn "Skipping '$f' -- not a lossless codec"
+		fi
+	done < <(find "$INPUT_BASE" -type f \( "${FIND_NAMES[@]}" \) -print0 2>/dev/null)
+
 	[[ ${#INPUT_FILES[@]} -eq 0 ]] && die "No lossless audio files found in '$INPUT'"
-	echo "Found ${#INPUT_FILES[@]} lossless file(s) in '$INPUT'"
+	echo "Found ${#INPUT_FILES[@]} lossless file(s) in '$INPUT' (recursive)"
 elif [[ -f "$INPUT" ]]; then
 	if ! is_lossless "$INPUT"; then
 		die "Input should be lossless (detected codec: $(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$INPUT" 2>/dev/null || echo 'unknown')). Accepted formats: FLAC, WAV, AIFF, ALAC."
 	fi
-	INPUT_FILES+=("$INPUT")
+	INPUT_FILES+=("$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")")
 else
 	die "Input '$INPUT' is neither a file nor a directory"
 fi
@@ -170,48 +184,71 @@ JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 IFS=',' read -ra CODEC_LIST <<<"$CODECS"
 IFS=',' read -ra BITRATE_LIST <<<"$BITRATES"
 
-# Create codec subdirectories
-for codec in "${CODEC_LIST[@]}"; do
-	mkdir -p "$OUTPUT/$codec"
-done
-
 # -- Encode --------------------------------------------------------------------
 
+# Output path: {output}/{relative-path}/{basename}/{codec}_{bitrate}.{ext}
+# For single file input: {output}/{basename}/{codec}_{bitrate}.{ext}
+
 encode() {
-	local input_file="$1" codec="$2" br="$3" ext="$4"
-	shift 4
+	local input_file="$1" outdir="$2" codec="$3" br="$4" ext="$5"
+	shift 5
 	local extra=("$@")
-	local basename
-	basename=$(basename "${input_file%.*}")
-	local outfile="$OUTPUT/${codec}/${basename}_${br}.${ext}"
-	echo "Encoding: $(basename "$input_file") -> ${codec}/${basename}_${br}.${ext}"
+	local outfile="$outdir/${codec}_${br}.${ext}"
+	mkdir -p "$outdir"
+	echo "Encoding: ${outfile#"$OUTPUT"/}"
 	ffmpeg -y -i "$input_file" "${extra[@]}" "$outfile" 2>/dev/null
 }
 
 export -f encode
 export OUTPUT
 
+# Compute the output subdirectory for a given input file
+get_outdir() {
+	local file="$1"
+	local basename
+	basename=$(basename "${file%.*}")
+
+	if [[ -n "$INPUT_BASE" ]]; then
+		# Directory mode: mirror relative path
+		local dir
+		dir=$(dirname "$file")
+		local reldir="${dir#"$INPUT_BASE"}"
+		reldir="${reldir#/}" # strip leading slash
+		if [[ -n "$reldir" ]]; then
+			echo "$OUTPUT/$reldir/$basename"
+		else
+			echo "$OUTPUT/$basename"
+		fi
+	else
+		# Single file mode
+		echo "$OUTPUT/$basename"
+	fi
+}
+
 # Build job list for a single file
 build_jobs_for_file() {
 	local file="$1"
+	local outdir
+	outdir=$(get_outdir "$file")
+
 	for codec in "${CODEC_LIST[@]}"; do
 		case "$codec" in
 		flac)
-			echo "$file flac 0 flac -c:a flac"
+			echo "$file $outdir flac 0 flac -c:a flac"
 			;;
 		opus)
 			for br in "${BITRATE_LIST[@]}"; do
-				echo "$file opus $br ogg -c:a libopus -b:a ${br}k"
+				echo "$file $outdir opus $br ogg -c:a libopus -b:a ${br}k"
 			done
 			;;
 		mp3)
 			for br in "${BITRATE_LIST[@]}"; do
-				echo "$file mp3 $br mp3 -c:a libmp3lame -b:a ${br}k"
+				echo "$file $outdir mp3 $br mp3 -c:a libmp3lame -b:a ${br}k"
 			done
 			;;
 		aac)
 			for br in "${BITRATE_LIST[@]}"; do
-				echo "$file aac $br m4a -c:a aac -b:a ${br}k"
+				echo "$file $outdir aac $br m4a -c:a aac -b:a ${br}k"
 			done
 			;;
 		*)
