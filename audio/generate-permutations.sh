@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# Generate codec+bitrate permutations from a lossless audio source.
+# Generate codec+bitrate permutations from lossless audio source(s).
 #
 # Usage:
 #   ./generate-permutations.sh <input> [output-dir]
-#   ./generate-permutations.sh -i <input> -o <output-dir>
-#   ./generate-permutations.sh -i <input> -c opus,mp3 -b 128,96,64
+#   ./generate-permutations.sh -i <input-file-or-dir> -o <output-dir>
+#   ./generate-permutations.sh -i ./lossless/ -c opus,mp3 -b 128,96,64
 #
 # Options:
-#   -i, --input     Input file (lossless: FLAC, WAV, AIFF, ALAC)
+#   -i, --input     Input file or directory (lossless: FLAC, WAV, AIFF, ALAC)
 #   -o, --output    Output directory (default: current directory)
 #   -c, --codecs    Comma-separated codecs to generate (default: flac,opus,mp3,aac)
 #   -b, --bitrates  Comma-separated bitrates in kbps (default: 320,256,192,160,128,96,64,48,32)
 #   -h, --help      Show this help
+#
+# When input is a directory, all audio files in it (non-recursive) are processed.
+# Non-lossless files in the directory are skipped with a warning.
 #
 # Output structure:
 #   <output-dir>/
@@ -30,6 +33,7 @@ set -euo pipefail
 
 ALL_CODECS="flac,opus,mp3,aac"
 ALL_BITRATES="320,256,192,160,128,96,64,48,32"
+AUDIO_EXTENSIONS="flac wav aiff aif alac wv"
 LOSSLESS_FORMATS="flac alac wavpack wav aiff pcm_s16le pcm_s24le pcm_s32le pcm_f32le pcm_s16be pcm_s24be pcm_s32be"
 
 INPUT=""
@@ -43,10 +47,11 @@ usage() {
 	cat <<-'USAGE'
 		Usage:
 		  generate-permutations.sh <input> [output-dir]
-		  generate-permutations.sh -i <input> [-o <output-dir>] [-c codecs] [-b bitrates]
+		  generate-permutations.sh -i <input-file-or-dir> [-o <output-dir>] [-c codecs] [-b bitrates]
 
 		Options:
-		  -i, --input     Input file (must be lossless: FLAC, WAV, AIFF, ALAC, etc.)
+		  -i, --input     Input file or directory (must be lossless: FLAC, WAV, AIFF, ALAC, etc.)
+		                  When a directory, all audio files in it are processed (non-recursive).
 		  -o, --output    Output directory (default: current directory)
 		  -c, --codecs    Comma-separated codecs (default: flac,opus,mp3,aac)
 		  -b, --bitrates  Comma-separated bitrates in kbps (default: 320,256,192,160,128,96,64,48,32)
@@ -55,6 +60,7 @@ usage() {
 		Examples:
 		  generate-permutations.sh track.flac
 		  generate-permutations.sh -i track.wav -o ./out -c opus,mp3 -b 128,96,64
+		  generate-permutations.sh -i ./lossless-tracks/ -o ./out
 	USAGE
 	exit "${1:-0}"
 }
@@ -64,13 +70,17 @@ die() {
 	exit 1
 }
 
-check_lossless() {
+warn() {
+	echo "Warning: $1" >&2
+}
+
+is_lossless() {
 	local codec
 	codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$1" 2>/dev/null)
 	for fmt in $LOSSLESS_FORMATS; do
 		[[ "$codec" == "$fmt" ]] && return 0
 	done
-	die "Input should be lossless (detected codec: ${codec:-unknown}). Accepted formats: FLAC, WAV, AIFF, ALAC."
+	return 1
 }
 
 # -- Parse args ----------------------------------------------------------------
@@ -116,7 +126,7 @@ if [[ "$OUTPUT" == "." && ${#POSITIONAL[@]} -ge 2 ]]; then
 fi
 
 [[ -z "$INPUT" ]] && usage 1
-[[ ! -f "$INPUT" ]] && die "Input file '$INPUT' not found"
+[[ ! -e "$INPUT" ]] && die "Input '$INPUT' not found"
 
 # Apply defaults
 CODECS="${CODECS:-$ALL_CODECS}"
@@ -126,11 +136,35 @@ BITRATES="${BITRATES:-$ALL_BITRATES}"
 
 command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required but not found in PATH"
 command -v ffprobe >/dev/null 2>&1 || die "ffprobe is required but not found in PATH"
-check_lossless "$INPUT"
+
+# -- Resolve input files -------------------------------------------------------
+
+INPUT_FILES=()
+
+if [[ -d "$INPUT" ]]; then
+	for ext in $AUDIO_EXTENSIONS; do
+		for f in "$INPUT"/*."$ext"; do
+			[[ -f "$f" ]] || continue
+			if is_lossless "$f"; then
+				INPUT_FILES+=("$f")
+			else
+				warn "Skipping '$(basename "$f")' -- not a lossless codec"
+			fi
+		done
+	done
+	[[ ${#INPUT_FILES[@]} -eq 0 ]] && die "No lossless audio files found in '$INPUT'"
+	echo "Found ${#INPUT_FILES[@]} lossless file(s) in '$INPUT'"
+elif [[ -f "$INPUT" ]]; then
+	if ! is_lossless "$INPUT"; then
+		die "Input should be lossless (detected codec: $(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$INPUT" 2>/dev/null || echo 'unknown')). Accepted formats: FLAC, WAV, AIFF, ALAC."
+	fi
+	INPUT_FILES+=("$INPUT")
+else
+	die "Input '$INPUT' is neither a file nor a directory"
+fi
 
 # -- Setup ---------------------------------------------------------------------
 
-BASENAME=$(basename "${INPUT%.*}")
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
 IFS=',' read -ra CODEC_LIST <<<"$CODECS"
@@ -144,51 +178,61 @@ done
 # -- Encode --------------------------------------------------------------------
 
 encode() {
-	local codec="$1" br="$2" ext="$3"
-	shift 3
+	local input_file="$1" codec="$2" br="$3" ext="$4"
+	shift 4
 	local extra=("$@")
-	local outfile="$OUTPUT/${codec}/${BASENAME}_${br}.${ext}"
-	echo "Encoding: ${codec}/${br}kbps -> ${codec}/$(basename "$outfile")"
-	ffmpeg -y -i "$INPUT" "${extra[@]}" "$outfile" 2>/dev/null
+	local basename
+	basename=$(basename "${input_file%.*}")
+	local outfile="$OUTPUT/${codec}/${basename}_${br}.${ext}"
+	echo "Encoding: $(basename "$input_file") -> ${codec}/${basename}_${br}.${ext}"
+	ffmpeg -y -i "$input_file" "${extra[@]}" "$outfile" 2>/dev/null
 }
 
 export -f encode
-export INPUT OUTPUT BASENAME
+export OUTPUT
 
-# Build job list
-build_jobs() {
+# Build job list for a single file
+build_jobs_for_file() {
+	local file="$1"
 	for codec in "${CODEC_LIST[@]}"; do
 		case "$codec" in
 		flac)
-			echo "flac 0 flac -c:a flac"
+			echo "$file flac 0 flac -c:a flac"
 			;;
 		opus)
 			for br in "${BITRATE_LIST[@]}"; do
-				echo "opus $br ogg -c:a libopus -b:a ${br}k"
+				echo "$file opus $br ogg -c:a libopus -b:a ${br}k"
 			done
 			;;
 		mp3)
 			for br in "${BITRATE_LIST[@]}"; do
-				echo "mp3 $br mp3 -c:a libmp3lame -b:a ${br}k"
+				echo "$file mp3 $br mp3 -c:a libmp3lame -b:a ${br}k"
 			done
 			;;
 		aac)
 			for br in "${BITRATE_LIST[@]}"; do
-				echo "aac $br m4a -c:a aac -b:a ${br}k"
+				echo "$file aac $br m4a -c:a aac -b:a ${br}k"
 			done
 			;;
 		*)
-			echo "Warning: unknown codec '$codec', skipping" >&2
+			warn "Unknown codec '$codec', skipping"
 			;;
 		esac
 	done
 }
 
-TOTAL=$(build_jobs | wc -l | tr -d ' ')
-echo "Generating $TOTAL files from '$(basename "$INPUT")' into '$OUTPUT/' (parallel=$JOBS)"
+# Build full job list across all input files
+build_all_jobs() {
+	for file in "${INPUT_FILES[@]}"; do
+		build_jobs_for_file "$file"
+	done
+}
+
+TOTAL=$(build_all_jobs | wc -l | tr -d ' ')
+echo "Generating $TOTAL files into '$OUTPUT/' (parallel=$JOBS)"
 echo ""
 
-build_jobs | xargs -P "$JOBS" -I {} bash -c 'encode {}'
+build_all_jobs | xargs -P "$JOBS" -I {} bash -c 'encode {}'
 
 echo ""
 echo "Done. Generated $TOTAL files in $OUTPUT/"
