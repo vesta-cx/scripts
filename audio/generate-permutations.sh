@@ -17,21 +17,31 @@
 # Non-lossless files are skipped with a warning.
 #
 # Output structure (source-first, mirrors input directory structure):
-#   Single file input:
-#     <output>/{basename}/{codec}_{bitrate}.{ext}
+#   Single file:
+#     <output>/{codec}/{basename}_{codec}_{bitrate}.{ext}
 #
-#   Directory input:
-#     <output>/{relative-path}/{basename}/{codec}_{bitrate}.{ext}
+#   Directory (mirrors input structure):
+#     <output>/{relative-path}/{codec}/{basename}_{codec}_{bitrate}.{ext}
 #
-#   Example:
-#     input: music/jazz/take-five.flac
-#     output: out/jazz/take-five/opus_128.ogg
-#                                mp3_128.mp3
-#                                flac_0.flac
+#   Examples:
+#     Single: ./gen.sh take-five.flac -o out
+#       out/opus/take-five_opus_128.ogg
+#
+#     Directory: ./gen.sh -i albums/ -o out
+#       Input:  albums/jazz/take-five.flac
+#       Output: out/jazz/opus/take-five_opus_128.ogg
+#               out/jazz/mp3/take-five_mp3_128.mp3
+#               out/jazz/flac/take-five_flac_0.flac
 #
 # Notes:
 #   - FLAC ignores the bitrate list (always outputs as lossless / bitrate=0)
 #   - Runs ffmpeg jobs in parallel (one per CPU core)
+#   - Metadata from source files is preserved in all outputs (-map_metadata 0)
+#   - When ARTIST is "Various Artists" (Bandcamp compilations), parses artist from filename
+#     (pattern: "... - NNN artistname - title") and overrides ARTIST in outputs
+#   - MP3 outputs include ID3v2.3 tags (-id3v2_version 3)
+#   - AAC/M4A outputs use -movflags +faststart for reliable container finalization
+#   - Encode errors are logged to <output>/.encode.log; 0-byte files are auto-deleted
 
 set -euo pipefail
 
@@ -87,6 +97,24 @@ is_lossless() {
 		[[ "$codec" == "$fmt" ]] && return 0
 	done
 	return 1
+}
+
+# Get ARTIST tag from source (empty if missing)
+get_artist_tag() {
+	ffprobe -v error -show_entries format_tags=artist -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null || echo ""
+}
+
+# Parse artist from Bandcamp-style filename: "... - NNN artistname - title.ext"
+# Returns artist or empty if pattern doesn't match.
+parse_artist_from_filename() {
+	local bn="$1"
+	local rest="${bn% - *}"
+	local artist_part="${rest##* - }"
+	if [[ "$artist_part" =~ ^[0-9]+[[:space:]] ]]; then
+		echo "$artist_part" | sed -E 's/^[0-9]+[[:space:]]+//'
+	else
+		echo ""
+	fi
 }
 
 # -- Parse args ----------------------------------------------------------------
@@ -180,75 +208,162 @@ fi
 # -- Setup ---------------------------------------------------------------------
 
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+ENCODE_LOG="${OUTPUT}/.encode.log"
+FAIL_DIR=$(mktemp -d)
+PROGRESS_DIR=$(mktemp -d)
+export FAIL_DIR PROGRESS_DIR
+
+# Cleanup on SIGINT/SIGTERM
+cleanup_on_signal() {
+	echo ""
+	echo "Interrupted. Stopping encode jobs..."
+	for pid in $(jobs -p 2>/dev/null); do
+		kill -TERM "$pid" 2>/dev/null || true
+	done
+	[[ -n "${PROGRESS_PID:-}" ]] && kill -TERM "$PROGRESS_PID" 2>/dev/null || true
+	wait 2>/dev/null || true
+	rm -rf "$FAIL_DIR" "$PROGRESS_DIR"
+	exit 130
+}
+trap cleanup_on_signal INT TERM
+
+# Clear previous log
+mkdir -p "$OUTPUT"
+: >"$ENCODE_LOG"
 
 IFS=',' read -ra CODEC_LIST <<<"$CODECS"
 IFS=',' read -ra BITRATE_LIST <<<"$BITRATES"
 
+# Precompute total encodes for progress
+TOTAL_ENCODES=0
+for _file in "${INPUT_FILES[@]}"; do
+	for c in "${CODEC_LIST[@]}"; do
+		case "$c" in
+		flac) TOTAL_ENCODES=$((TOTAL_ENCODES + 1)) ;;
+		opus | mp3 | aac) TOTAL_ENCODES=$((TOTAL_ENCODES + ${#BITRATE_LIST[@]})) ;;
+		esac
+	done
+done
+
 # -- Encode --------------------------------------------------------------------
 
-# Output path: {output}/{relative-path}/{basename}/{codec}_{bitrate}.{ext}
-# For single file input: {output}/{basename}/{codec}_{bitrate}.{ext}
-
 encode() {
-	local input_file="$1" outdir="$2" codec="$3" br="$4" ext="$5"
-	shift 5
-	local extra=("$@")
-	local outfile="$outdir/${codec}_${br}.${ext}"
-	mkdir -p "$outdir"
-	echo "Encoding: ${outfile#"$OUTPUT"/}"
-	ffmpeg -y -i "$input_file" "${extra[@]}" "$outfile" 2>/dev/null
-}
-
-export -f encode
-export OUTPUT
-
-# Compute the output subdirectory for a given input file
-get_outdir() {
-	local file="$1"
+	local input_file="$1" codec="$2" br="$3" ext="$4"
+	shift 4
+	local extra=("$@") meta_args=()
 	local basename
-	basename=$(basename "${file%.*}")
+	basename=$(basename "${input_file%.*}")
 
+	# Various Artists (Bandcamp): parse artist from filename and override in output
+	local src_artist
+	src_artist=$(get_artist_tag "$input_file" 2>/dev/null || true)
+	if [[ "$src_artist" == "Various Artists" ]]; then
+		local parsed
+		parsed=$(parse_artist_from_filename "$basename" 2>/dev/null || true)
+		if [[ -n "$parsed" ]]; then
+			meta_args=(-metadata "artist=$parsed")
+		fi
+	fi
+
+	# Build output dir: {output}/{relative-path}/{codec} or {output}/{codec}
+	local outdir
 	if [[ -n "$INPUT_BASE" ]]; then
-		# Directory mode: mirror relative path
-		local dir
-		dir=$(dirname "$file")
-		local reldir="${dir#"$INPUT_BASE"}"
-		reldir="${reldir#/}" # strip leading slash
+		local dir reldir
+		dir=$(dirname "$input_file")
+		reldir="${dir#"$INPUT_BASE"}"
+		reldir="${reldir#/}"
 		if [[ -n "$reldir" ]]; then
-			echo "$OUTPUT/$reldir/$basename"
+			outdir="$OUTPUT/$reldir/$codec"
 		else
-			echo "$OUTPUT/$basename"
+			outdir="$OUTPUT/$codec"
 		fi
 	else
-		# Single file mode
-		echo "$OUTPUT/$basename"
+		outdir="$OUTPUT/$codec"
 	fi
+
+	local outfile="$outdir/${basename}_${codec}_${br}.${ext}"
+	mkdir -p "$outdir"
+	if [[ ${#meta_args[@]} -gt 0 ]]; then
+		ffmpeg -y -i "$input_file" -map_metadata 0 "${meta_args[@]}" "${extra[@]}" "$outfile" 2>>"${ENCODE_LOG}"
+	else
+		ffmpeg -y -i "$input_file" -map_metadata 0 "${extra[@]}" "$outfile" 2>>"${ENCODE_LOG}"
+	fi
+
+	# Detect and clean up 0-byte output files (failed encodes)
+	if [[ -f "$outfile" && ! -s "$outfile" ]]; then
+		warn "0-byte output, encode failed: ${outfile#"$OUTPUT"/} (check ${ENCODE_LOG})"
+		rm -f "$outfile"
+		touch "${FAIL_DIR}/${codec}_${br}" # marker for parent to count
+	fi
+
+	echo . >>"${PROGRESS_DIR}/count"
 }
 
-# Build job list for a single file
-build_jobs_for_file() {
-	local file="$1"
-	local outdir
-	outdir=$(get_outdir "$file")
+export INPUT_BASE
+export PROGRESS_DIR
 
+# -- Process files -------------------------------------------------------------
+
+TOTAL=0
+RUNNING=0
+
+# Queue a single encode job in the background.
+# When the pool is full, wait for encode jobs to complete.
+# Uses plain wait (bash 3.2 compatible). Progress monitor is disowned so wait ignores it.
+queue_encode() {
+	while ((RUNNING >= JOBS)); do
+		wait
+		RUNNING=0
+	done
+	encode "$@" &
+	RUNNING=$((RUNNING + 1))
+	TOTAL=$((TOTAL + 1))
+}
+
+echo "Processing ${#INPUT_FILES[@]} file(s) into '$OUTPUT/' (parallel=$JOBS, $TOTAL_ENCODES encodes)"
+echo ""
+
+# Progress monitor: disowned so queue_encode's wait only sees encode jobs
+PROGRESS_PID=""
+PROGRESS_FILE="${PROGRESS_DIR}/count"
+: >"$PROGRESS_FILE"
+if ((TOTAL_ENCODES > 0)); then
+	(
+		prog_file="${PROGRESS_FILE}"
+		total=$TOTAL_ENCODES
+		while true; do
+			done_count=$(($(cat "$prog_file" 2>/dev/null | wc -l) + 0))
+			((done_count > total)) && done_count=$total
+			pct=$((total > 0 ? done_count * 100 / total : 0))
+			printf '\rProgress: %d/%d (%d%%)   ' "$done_count" "$total" "$pct"
+			[[ "$done_count" -ge "$total" ]] && break
+			sleep 0.25
+		done
+		echo ""
+	) &
+	PROGRESS_PID=$!
+	disown
+fi
+
+for file in "${INPUT_FILES[@]}"; do
 	for codec in "${CODEC_LIST[@]}"; do
 		case "$codec" in
 		flac)
-			echo "$file $outdir flac 0 flac -c:a flac"
+			queue_encode "$file" flac 0 flac -c:a flac
 			;;
 		opus)
 			for br in "${BITRATE_LIST[@]}"; do
-				echo "$file $outdir opus $br ogg -c:a libopus -b:a ${br}k"
+				queue_encode "$file" opus "$br" ogg -c:a libopus -b:a "${br}k"
 			done
 			;;
 		mp3)
 			for br in "${BITRATE_LIST[@]}"; do
-				echo "$file $outdir mp3 $br mp3 -c:a libmp3lame -b:a ${br}k"
+				queue_encode "$file" mp3 "$br" mp3 -c:a libmp3lame -b:a "${br}k" -id3v2_version 3
 			done
 			;;
 		aac)
 			for br in "${BITRATE_LIST[@]}"; do
-				echo "$file $outdir aac $br m4a -c:a aac -b:a ${br}k"
+				queue_encode "$file" aac "$br" m4a -map 0:a:0 -c:a aac -b:a "${br}k" -movflags +faststart
 			done
 			;;
 		*)
@@ -256,20 +371,20 @@ build_jobs_for_file() {
 			;;
 		esac
 	done
-}
+done
 
-# Build full job list across all input files
-build_all_jobs() {
-	for file in "${INPUT_FILES[@]}"; do
-		build_jobs_for_file "$file"
-	done
-}
+# Wait for remaining encode jobs, then for progress monitor to finish
+wait
+[[ -n "$PROGRESS_PID" ]] && wait "$PROGRESS_PID" 2>/dev/null || true
 
-TOTAL=$(build_all_jobs | wc -l | tr -d ' ')
-echo "Generating $TOTAL files into '$OUTPUT/' (parallel=$JOBS)"
-echo ""
-
-build_all_jobs | xargs -P "$JOBS" -I {} bash -c 'encode {}'
+# Count failures from marker files written by background jobs
+FAIL_COUNT=$(find "$FAIL_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+rm -rf "$FAIL_DIR" "$PROGRESS_DIR"
 
 echo ""
-echo "Done. Generated $TOTAL files in $OUTPUT/"
+if ((FAIL_COUNT > 0)); then
+	echo "Done. Generated $((TOTAL - FAIL_COUNT))/$TOTAL files in $OUTPUT/ ($FAIL_COUNT failed — see ${ENCODE_LOG})"
+else
+	echo "Done. Generated $TOTAL files in $OUTPUT/"
+	rm -f "$ENCODE_LOG" # Clean up empty log on success
+fi
