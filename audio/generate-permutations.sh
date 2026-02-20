@@ -36,7 +36,8 @@
 # Notes:
 #   - FLAC ignores the bitrate list (always outputs as lossless / bitrate=0)
 #   - Runs ffmpeg jobs in parallel (one per CPU core)
-#   - Metadata from source files is preserved in all outputs (-map_metadata 0)
+#   - Embedded artwork is stripped to save storage (many candidates per source = duplicated art).
+#     Text metadata (artist, title, album) is re-added from source via -metadata.
 #   - When ARTIST is "Various Artists" (Bandcamp compilations), parses artist from filename
 #     (pattern: "... - NNN artistname - title") and overrides ARTIST in outputs
 #   - MP3 outputs include ID3v2.3 tags (-id3v2_version 3)
@@ -99,9 +100,14 @@ is_lossless() {
 	return 1
 }
 
-# Get ARTIST tag from source (empty if missing)
+# Get a single metadata tag from source (empty if missing)
+get_tag() {
+	local file="$1" tag="$2"
+	ffprobe -v error -show_entries "format_tags=$tag" -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null || echo ""
+}
+
 get_artist_tag() {
-	ffprobe -v error -show_entries format_tags=artist -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null || echo ""
+	get_tag "$1" artist
 }
 
 # Parse artist from Bandcamp-style filename: "... - NNN artistname - title.ext"
@@ -254,16 +260,23 @@ encode() {
 	local basename
 	basename=$(basename "${input_file%.*}")
 
-	# Various Artists (Bandcamp): parse artist from filename and override in output
-	local src_artist
+	# Extract text metadata (strip artwork via -map_metadata -1; artwork duplicated across candidates wastes storage)
+	local src_artist src_title src_album
 	src_artist=$(get_artist_tag "$input_file" 2>/dev/null || true)
+	src_title=$(get_tag "$input_file" title 2>/dev/null || true)
+	src_album=$(get_tag "$input_file" album 2>/dev/null || true)
+
+	# Various Artists (Bandcamp): parse artist from filename and override
 	if [[ "$src_artist" == "Various Artists" ]]; then
 		local parsed
 		parsed=$(parse_artist_from_filename "$basename" 2>/dev/null || true)
-		if [[ -n "$parsed" ]]; then
-			meta_args=(-metadata "artist=$parsed")
-		fi
+		[[ -n "$parsed" ]] && src_artist="$parsed"
 	fi
+
+	# Re-add text metadata (excludes embedded artwork)
+	[[ -n "$src_artist" ]] && meta_args+=(-metadata "artist=$src_artist")
+	[[ -n "$src_title" ]] && meta_args+=(-metadata "title=$src_title")
+	[[ -n "$src_album" ]] && meta_args+=(-metadata "album=$src_album")
 
 	# Build output dir: {output}/{relative-path}/{codec} or {output}/{codec}
 	local outdir
@@ -283,11 +296,9 @@ encode() {
 
 	local outfile="$outdir/${basename}_${codec}_${br}.${ext}"
 	mkdir -p "$outdir"
-	if [[ ${#meta_args[@]} -gt 0 ]]; then
-		ffmpeg -y -i "$input_file" -map_metadata 0 "${meta_args[@]}" "${extra[@]}" "$outfile" 2>>"${ENCODE_LOG}"
-	else
-		ffmpeg -y -i "$input_file" -map_metadata 0 "${extra[@]}" "$outfile" 2>>"${ENCODE_LOG}"
-	fi
+	# -map 0:a: exclude any attached picture stream; -map_metadata -1: strip all metadata (including artwork)
+	# then re-add artist/title/album via meta_args
+	ffmpeg -y -i "$input_file" -map 0:a -map_metadata -1 "${meta_args[@]}" "${extra[@]}" "$outfile" 2>>"${ENCODE_LOG}"
 
 	# Detect and clean up 0-byte output files (failed encodes)
 	if [[ -f "$outfile" && ! -s "$outfile" ]]; then
@@ -363,7 +374,7 @@ for file in "${INPUT_FILES[@]}"; do
 			;;
 		aac)
 			for br in "${BITRATE_LIST[@]}"; do
-				queue_encode "$file" aac "$br" m4a -map 0:a:0 -c:a aac -b:a "${br}k" -movflags +faststart
+				queue_encode "$file" aac "$br" m4a -c:a aac -b:a "${br}k" -movflags +faststart
 			done
 			;;
 		*)
