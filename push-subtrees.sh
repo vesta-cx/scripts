@@ -37,6 +37,7 @@ do_push() {
   fi
   echo "Pushing subtree prefix=$path to remote $remote (branch $branch)"
   if ! git subtree push --prefix="$path" "$remote" "$branch"; then
+    echo "  -> If the remote has new commits, pull into the monorepo first: git subtree pull --prefix=$path $remote $branch" >&2
     FAILED=1
   fi
 }
@@ -86,7 +87,7 @@ done < "$GITTREES"
 do_push
 
 if [[ "$FAILED" -ne 0 ]]; then
-  echo "One or more subtree pushes failed." >&2
+  echo "One or more subtree pushes failed. Run 'git subtree pull --prefix=<path> <remote> <branch>' for each to sync the monorepo with the remote, then re-run this script." >&2
   exit 1
 fi
 echo "Done."
